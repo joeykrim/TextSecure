@@ -19,18 +19,20 @@ package org.thoughtcrime.securesms.crypto;
 
 import android.content.Context;
 import android.content.SharedPreferences;
-import android.support.annotation.NonNull;
-import android.support.annotation.Nullable;
-import android.text.TextUtils;
+import android.content.SharedPreferences.Editor;
+import android.os.SystemClock;
 import android.util.Log;
 
-import org.thoughtcrime.securesms.util.Base64;
-import org.thoughtcrime.securesms.util.Util;
-import org.whispersystems.libsignal.InvalidKeyException;
-import org.whispersystems.libsignal.ecc.Curve;
-import org.whispersystems.libsignal.ecc.ECKeyPair;
-import org.whispersystems.libsignal.ecc.ECPrivateKey;
-import org.whispersystems.libsignal.ecc.ECPublicKey;
+import org.whispersystems.textsecure.crypto.InvalidKeyException;
+import org.whispersystems.textsecure.crypto.MasterCipher;
+import org.whispersystems.textsecure.crypto.MasterSecret;
+import org.whispersystems.textsecure.crypto.PublicKey;
+import org.whispersystems.textsecure.crypto.ecc.Curve;
+import org.whispersystems.textsecure.crypto.ecc.ECKeyPair;
+import org.whispersystems.textsecure.crypto.ecc.ECPrivateKey;
+import org.whispersystems.textsecure.crypto.ecc.ECPublicKey;
+import org.whispersystems.textsecure.util.Base64;
+import org.whispersystems.textsecure.util.Util;
 
 import java.io.IOException;
 import java.security.GeneralSecurityException;
@@ -59,28 +61,22 @@ public class MasterSecretUtil {
   public static final String UNENCRYPTED_PASSPHRASE  = "unencrypted";
   public static final String PREFERENCES_NAME        = "SecureSMS-Preferences";
 
+  private static final String ASYMMETRIC_LOCAL_PUBLIC_NIST  = "asymmetric_master_secret_public";
+  private static final String ASYMMETRIC_LOCAL_PRIVATE_NIST = "asymmetric_master_secret_private";
   private static final String ASYMMETRIC_LOCAL_PUBLIC_DJB   = "asymmetric_master_secret_curve25519_public";
   private static final String ASYMMETRIC_LOCAL_PRIVATE_DJB  = "asymmetric_master_secret_curve25519_private";
+  private static final String GENERATED_ITERATION_COUNT     = "key_iterations_count";
+  private static final int DEFAULT_ITERATION_COUNT          = 99;
 
   public static MasterSecret changeMasterSecretPassphrase(Context context,
                                                           MasterSecret masterSecret,
                                                           String newPassphrase)
   {
     try {
-      byte[] combinedSecrets = Util.combine(masterSecret.getEncryptionKey().getEncoded(),
-                                            masterSecret.getMacKey().getEncoded());
+      byte[] combinedSecrets = combineSecrets(masterSecret.getEncryptionKey().getEncoded(),
+                                              masterSecret.getMacKey().getEncoded());
 
-      byte[] encryptionSalt               = generateSalt();
-      int    iterations                   = generateIterationCount(newPassphrase, encryptionSalt);
-      byte[] encryptedMasterSecret        = encryptWithPassphrase(encryptionSalt, iterations, combinedSecrets, newPassphrase);
-      byte[] macSalt                      = generateSalt();
-      byte[] encryptedAndMacdMasterSecret = macWithPassphrase(macSalt, iterations, encryptedMasterSecret, newPassphrase);
-
-      save(context, "encryption_salt", encryptionSalt);
-      save(context, "mac_salt", macSalt);
-      save(context, "passphrase_iterations", iterations);
-      save(context, "master_secret", encryptedAndMacdMasterSecret);
-      save(context, "passphrase_initialized", true);
+      encryptWithPassphraseAndSave(context, combinedSecrets, newPassphrase);
 
       return masterSecret;
     } catch (GeneralSecurityException gse) {
@@ -104,13 +100,10 @@ public class MasterSecretUtil {
   {
     try {
       byte[] encryptedAndMacdMasterSecret = retrieve(context, "master_secret");
-      byte[] macSalt                      = retrieve(context, "mac_salt");
-      int    iterations                   = retrieve(context, "passphrase_iterations", 100);
-      byte[] encryptedMasterSecret        = verifyMac(macSalt, iterations, encryptedAndMacdMasterSecret, passphrase);
-      byte[] encryptionSalt               = retrieve(context, "encryption_salt");
-      byte[] combinedSecrets              = decryptWithPassphrase(encryptionSalt, iterations, encryptedMasterSecret, passphrase);
-      byte[] encryptionSecret             = Util.split(combinedSecrets, 16, 20)[0];
-      byte[] macSecret                    = Util.split(combinedSecrets, 16, 20)[1];
+      byte[] encryptedMasterSecret        = verifyMac(context, encryptedAndMacdMasterSecret, passphrase);
+      byte[] combinedSecrets              = decryptWithPassphrase(context, encryptedMasterSecret, passphrase);
+      byte[] encryptionSecret             = getEncryptionSecret(combinedSecrets);
+      byte[] macSecret                    = getMacSecret(combinedSecrets);
 
       return new MasterSecret(new SecretKeySpec(encryptionSecret, "AES"),
                               new SecretKeySpec(macSecret, "HmacSHA1"));
@@ -123,15 +116,25 @@ public class MasterSecretUtil {
     }
   }
 
-  public static AsymmetricMasterSecret getAsymmetricMasterSecret(@NonNull  Context context,
-                                                                 @Nullable MasterSecret masterSecret)
+  public static AsymmetricMasterSecret getAsymmetricMasterSecret(Context context,
+                                                                 MasterSecret masterSecret)
   {
     try {
+      byte[] nistPublicBytes  = retrieve(context, ASYMMETRIC_LOCAL_PUBLIC_NIST);
       byte[] djbPublicBytes   = retrieve(context, ASYMMETRIC_LOCAL_PUBLIC_DJB);
+
+      byte[] nistPrivateBytes = retrieve(context, ASYMMETRIC_LOCAL_PRIVATE_NIST);
       byte[] djbPrivateBytes  = retrieve(context, ASYMMETRIC_LOCAL_PRIVATE_DJB);
 
-      ECPublicKey  djbPublicKey  = null;
-      ECPrivateKey djbPrivateKey = null;
+      ECPublicKey  nistPublicKey  = null;
+      ECPublicKey  djbPublicKey   = null;
+
+      ECPrivateKey nistPrivateKey = null;
+      ECPrivateKey djbPrivateKey  = null;
+
+      if (nistPublicBytes != null) {
+        nistPublicKey = new PublicKey(nistPublicBytes, 0).getKey();
+      }
 
       if (djbPublicBytes != null) {
         djbPublicKey = Curve.decodePoint(djbPublicBytes, 0);
@@ -140,14 +143,20 @@ public class MasterSecretUtil {
       if (masterSecret != null) {
         MasterCipher masterCipher = new MasterCipher(masterSecret);
 
+        if (nistPrivateBytes != null) {
+          nistPrivateKey = masterCipher.decryptKey(Curve.NIST_TYPE, nistPrivateBytes);
+        }
+
         if (djbPrivateBytes != null) {
-          djbPrivateKey = masterCipher.decryptKey(djbPrivateBytes);
+          djbPrivateKey = masterCipher.decryptKey(Curve.DJB_TYPE, djbPrivateBytes);
         }
       }
 
-      return new AsymmetricMasterSecret(djbPublicKey, djbPrivateKey);
-    } catch (InvalidKeyException | IOException ike) {
+      return new AsymmetricMasterSecret(djbPublicKey, djbPrivateKey, nistPublicKey, nistPrivateKey);
+    } catch (InvalidKeyException ike) {
       throw new AssertionError(ike);
+    } catch (IOException e) {
+      throw new AssertionError(e);
     }
   }
 
@@ -155,33 +164,24 @@ public class MasterSecretUtil {
                                                                       MasterSecret masterSecret)
   {
     MasterCipher masterCipher = new MasterCipher(masterSecret);
-    ECKeyPair    keyPair      = Curve.generateKeyPair();
+    ECKeyPair    keyPair      = Curve.generateKeyPairForType(Curve.DJB_TYPE);
 
     save(context, ASYMMETRIC_LOCAL_PUBLIC_DJB, keyPair.getPublicKey().serialize());
     save(context, ASYMMETRIC_LOCAL_PRIVATE_DJB, masterCipher.encryptKey(keyPair.getPrivateKey()));
 
-    return new AsymmetricMasterSecret(keyPair.getPublicKey(), keyPair.getPrivateKey());
+    return new AsymmetricMasterSecret(keyPair.getPublicKey(), keyPair.getPrivateKey(), null, null);
   }
 
   public static MasterSecret generateMasterSecret(Context context, String passphrase) {
     try {
       byte[] encryptionSecret             = generateEncryptionSecret();
       byte[] macSecret                    = generateMacSecret();
-      byte[] masterSecret                 = Util.combine(encryptionSecret, macSecret);
-      byte[] encryptionSalt               = generateSalt();
-      int    iterations                   = generateIterationCount(passphrase, encryptionSalt);
-      byte[] encryptedMasterSecret        = encryptWithPassphrase(encryptionSalt, iterations, masterSecret, passphrase);
-      byte[] macSalt                      = generateSalt();
-      byte[] encryptedAndMacdMasterSecret = macWithPassphrase(macSalt, iterations, encryptedMasterSecret, passphrase);
+      byte[] masterSecret                 = combineSecrets(encryptionSecret, macSecret);
 
-      save(context, "encryption_salt", encryptionSalt);
-      save(context, "mac_salt", macSalt);
-      save(context, "passphrase_iterations", iterations);
-      save(context, "master_secret", encryptedAndMacdMasterSecret);
-      save(context, "passphrase_initialized", true);
+      encryptWithPassphraseAndSave(context, masterSecret, passphrase);
 
       return new MasterSecret(new SecretKeySpec(encryptionSecret, "AES"),
-                              new SecretKeySpec(macSecret, "HmacSHA1"));
+			      new SecretKeySpec(macSecret, "HmacSHA1"));
     } catch (GeneralSecurityException e) {
       Log.w("keyutil", e);
       return null;
@@ -190,7 +190,10 @@ public class MasterSecretUtil {
 
   public static boolean hasAsymmericMasterSecret(Context context) {
     SharedPreferences settings = context.getSharedPreferences(PREFERENCES_NAME, 0);
-    return settings.contains(ASYMMETRIC_LOCAL_PUBLIC_DJB);
+
+    return
+        settings.contains(ASYMMETRIC_LOCAL_PUBLIC_NIST) ||
+        settings.contains(ASYMMETRIC_LOCAL_PUBLIC_DJB);
   }
 
   public static boolean isPassphraseInitialized(Context context) {
@@ -198,47 +201,99 @@ public class MasterSecretUtil {
     return preferences.getBoolean("passphrase_initialized", false);
   }
 
-  private static void save(Context context, String key, int value) {
-    if (!context.getSharedPreferences(PREFERENCES_NAME, 0)
-                .edit()
-                .putInt(key, value)
-                .commit())
-    {
-      throw new AssertionError("failed to save a shared pref in MasterSecretUtil");
-    }
+  private static void encryptWithPassphraseAndSave(Context context, byte[] masterSecret, String passphrase) throws GeneralSecurityException {
+    byte[] encryptedMasterSecret        = encryptWithPassphrase(context, masterSecret, passphrase);
+    byte[] encryptedAndMacdMasterSecret = macWithPassphrase(context, encryptedMasterSecret, passphrase);
+
+    save(context, "master_secret", encryptedAndMacdMasterSecret);
+    save(context, "passphrase_initialized", true);
+  }
+
+  private static byte[] getEncryptionSecret(byte[] combinedSecrets) {
+    byte[] encryptionSecret = new byte[16];
+    System.arraycopy(combinedSecrets, 0, encryptionSecret, 0, encryptionSecret.length);
+    return encryptionSecret;
+  }
+
+  private static byte[] getMacSecret(byte[] combinedSecrets) {
+    byte[] macSecret = new byte[20];
+    System.arraycopy(combinedSecrets, 16, macSecret, 0, macSecret.length);
+    return macSecret;
+  }
+
+  private static byte[] combineSecrets(byte[] encryptionSecret, byte[] macSecret) {
+    byte[] combinedSecret = new byte[encryptionSecret.length + macSecret.length];
+    System.arraycopy(encryptionSecret, 0, combinedSecret, 0, encryptionSecret.length);
+    System.arraycopy(macSecret, 0, combinedSecret, encryptionSecret.length, macSecret.length);
+
+    return combinedSecret;
   }
 
   private static void save(Context context, String key, byte[] value) {
-    if (!context.getSharedPreferences(PREFERENCES_NAME, 0)
-                .edit()
-                .putString(key, Base64.encodeBytes(value))
-                .commit())
-    {
-      throw new AssertionError("failed to save a shared pref in MasterSecretUtil");
-    }
+    SharedPreferences settings = context.getSharedPreferences(PREFERENCES_NAME, 0);
+    Editor editor              = settings.edit();
+
+    editor.putString(key, Base64.encodeBytes(value));
+    editor.commit();
   }
 
   private static void save(Context context, String key, boolean value) {
-    if (!context.getSharedPreferences(PREFERENCES_NAME, 0)
-                .edit()
-                .putBoolean(key, value)
-                .commit())
-    {
-      throw new AssertionError("failed to save a shared pref in MasterSecretUtil");
-    }
+    SharedPreferences settings = context.getSharedPreferences(PREFERENCES_NAME, 0);
+    Editor editor              = settings.edit();
+
+    editor.putBoolean(key, value);
+    editor.commit();
+  }
+
+  private static void save(Context context, String key, int value) {
+    SharedPreferences settings = context.getSharedPreferences(PREFERENCES_NAME, 0);
+    Editor editor              = settings.edit();
+
+    editor.putInt(key, value);
+    editor.commit();
   }
 
   private static byte[] retrieve(Context context, String key) throws IOException {
     SharedPreferences settings = context.getSharedPreferences(PREFERENCES_NAME, 0);
     String encodedValue        = settings.getString(key, "");
 
-    if (TextUtils.isEmpty(encodedValue)) return null;
-    else                                 return Base64.decode(encodedValue);
+    if (Util.isEmpty(encodedValue)) return null;
+    else                            return Base64.decode(encodedValue);
   }
 
-  private static int retrieve(Context context, String key, int defaultValue) throws IOException {
+  private static int getIterations(Context context, String passphrase, byte[] salt) {
     SharedPreferences settings = context.getSharedPreferences(PREFERENCES_NAME, 0);
-    return settings.getInt(key, defaultValue);
+    int iterations             = settings.getInt(GENERATED_ITERATION_COUNT, DEFAULT_ITERATION_COUNT);
+
+    if (iterations == DEFAULT_ITERATION_COUNT) {
+      iterations               = generateIterationTarget(passphrase, salt);
+      save(context, GENERATED_ITERATION_COUNT, iterations);
+    }
+
+    return iterations;
+  }
+
+  private static int generateIterationTarget(String passphrase, byte[] salt) {
+    int TARGET_ITERATION_TIME      = 500;   //ms
+    int MINIMUM_ITERATION_COUNT    = 100;   //default for low-end devices
+    int BASELINE_ITERATION_COUNT   = 10000; //baseline starting iteration count
+    SecretKeyFactory skf           = null;
+
+    long startTime                 = SystemClock.elapsedRealtime();
+    PBEKeySpec keyspec             = new PBEKeySpec(passphrase.toCharArray(), salt, BASELINE_ITERATION_COUNT);
+    try {
+      skf                          = SecretKeyFactory.getInstance("PBEWITHSHA1AND128BITAES-CBC-BC");
+      skf.generateSecret(keyspec);
+    } catch (NoSuchAlgorithmException e) {
+      //Do nothing.
+    } catch (InvalidKeySpecException e) {
+      //Do nothing.
+    }
+    long finishTime                = SystemClock.elapsedRealtime();
+    int scaledIterationTarget      = (int)(((double)BASELINE_ITERATION_COUNT / (double)(finishTime - startTime)) * TARGET_ITERATION_TIME);
+
+    if (scaledIterationTarget < MINIMUM_ITERATION_COUNT) return MINIMUM_ITERATION_COUNT;
+    return scaledIterationTarget;
   }
 
   private static byte[] generateEncryptionSecret() {
@@ -272,78 +327,49 @@ public class MasterSecretUtil {
     return salt;
   }
 
-  private static int generateIterationCount(String passphrase, byte[] salt) {
-    int TARGET_ITERATION_TIME     = 50;   //ms
-    int MINIMUM_ITERATION_COUNT   = 100;   //default for low-end devices
-    int BENCHMARK_ITERATION_COUNT = 10000; //baseline starting iteration count
-
-    try {
-      PBEKeySpec       keyspec = new PBEKeySpec(passphrase.toCharArray(), salt, BENCHMARK_ITERATION_COUNT);
-      SecretKeyFactory skf     = SecretKeyFactory.getInstance("PBEWITHSHA1AND128BITAES-CBC-BC");
-
-      long startTime = System.currentTimeMillis();
-      skf.generateSecret(keyspec);
-      long finishTime = System.currentTimeMillis();
-
-      int scaledIterationTarget = (int) (((double)BENCHMARK_ITERATION_COUNT / (double)(finishTime - startTime)) * TARGET_ITERATION_TIME);
-
-      if (scaledIterationTarget < MINIMUM_ITERATION_COUNT) return MINIMUM_ITERATION_COUNT;
-      else                                                 return scaledIterationTarget;
-    } catch (NoSuchAlgorithmException e) {
-      Log.w("MasterSecretUtil", e);
-      return MINIMUM_ITERATION_COUNT;
-    } catch (InvalidKeySpecException e) {
-      Log.w("MasterSecretUtil", e);
-      return MINIMUM_ITERATION_COUNT;
-    }
-  }
-
-  private static SecretKey getKeyFromPassphrase(String passphrase, byte[] salt, int iterations)
-      throws GeneralSecurityException
-  {
-    PBEKeySpec keyspec    = new PBEKeySpec(passphrase.toCharArray(), salt, iterations);
+  private static SecretKey getKeyFromPassphrase(Context context, String passphrase, byte[] salt) throws GeneralSecurityException {
+    PBEKeySpec keyspec    = new PBEKeySpec(passphrase.toCharArray(), salt, getIterations(context, passphrase, salt));
     SecretKeyFactory skf  = SecretKeyFactory.getInstance("PBEWITHSHA1AND128BITAES-CBC-BC");
+
     return skf.generateSecret(keyspec);
   }
 
-  private static Cipher getCipherFromPassphrase(String passphrase, byte[] salt, int iterations, int opMode)
-      throws GeneralSecurityException
-  {
-    SecretKey key    = getKeyFromPassphrase(passphrase, salt, iterations);
-    Cipher    cipher = Cipher.getInstance(key.getAlgorithm());
-    cipher.init(opMode, key, new PBEParameterSpec(salt, iterations));
+  private static Cipher getCipherFromPassphrase(Context context, String passphrase, byte[] salt, int opMode) throws GeneralSecurityException {
+    SecretKey key              = getKeyFromPassphrase(context, passphrase, salt);
+    Cipher cipher              = Cipher.getInstance(key.getAlgorithm());
+    cipher.init(opMode, key, new PBEParameterSpec(salt, getIterations(context, passphrase, salt)));
 
     return cipher;
   }
 
-  private static byte[] encryptWithPassphrase(byte[] encryptionSalt, int iterations, byte[] data, String passphrase)
-      throws GeneralSecurityException
-  {
-    Cipher cipher = getCipherFromPassphrase(passphrase, encryptionSalt, iterations, Cipher.ENCRYPT_MODE);
+  private static byte[] encryptWithPassphrase(Context context, byte[] data, String passphrase) throws GeneralSecurityException {
+    byte[] encryptionSalt = generateSalt();
+    Cipher cipher         = getCipherFromPassphrase(context, passphrase, encryptionSalt, Cipher.ENCRYPT_MODE);
+    byte[] cipherText     = cipher.doFinal(data);
+
+    save(context, "encryption_salt", encryptionSalt);
+    return cipherText;
+  }
+
+  private static byte[] decryptWithPassphrase(Context context, byte[] data, String passphrase) throws GeneralSecurityException, IOException {
+    byte[] encryptionSalt = retrieve(context, "encryption_salt");
+    Cipher cipher         = getCipherFromPassphrase(context, passphrase, encryptionSalt, Cipher.DECRYPT_MODE);
     return cipher.doFinal(data);
   }
 
-  private static byte[] decryptWithPassphrase(byte[] encryptionSalt, int iterations, byte[] data, String passphrase)
-      throws GeneralSecurityException, IOException
-  {
-    Cipher cipher = getCipherFromPassphrase(passphrase, encryptionSalt, iterations, Cipher.DECRYPT_MODE);
-    return cipher.doFinal(data);
-  }
-
-  private static Mac getMacForPassphrase(String passphrase, byte[] salt, int iterations)
-      throws GeneralSecurityException
-  {
-    SecretKey     key     = getKeyFromPassphrase(passphrase, salt, iterations);
-    byte[]        pbkdf2  = key.getEncoded();
-    SecretKeySpec hmacKey = new SecretKeySpec(pbkdf2, "HmacSHA1");
-    Mac           hmac    = Mac.getInstance("HmacSHA1");
+  private static Mac getMacForPassphrase(Context context, String passphrase, byte[] salt) throws GeneralSecurityException {
+    SecretKey key              = getKeyFromPassphrase(context, passphrase, salt);
+    byte[] pbkdf2              = key.getEncoded();
+    SecretKeySpec hmacKey      = new SecretKeySpec(pbkdf2, "HmacSHA1");
+    Mac hmac                   = Mac.getInstance("HmacSHA1");
     hmac.init(hmacKey);
 
     return hmac;
   }
 
-  private static byte[] verifyMac(byte[] macSalt, int iterations, byte[] encryptedAndMacdData, String passphrase) throws InvalidPassphraseException, GeneralSecurityException, IOException {
-    Mac hmac        = getMacForPassphrase(passphrase, macSalt, iterations);
+  private static byte[] verifyMac(Context context, byte[] encryptedAndMacdData, String passphrase) throws InvalidPassphraseException, GeneralSecurityException, IOException {
+    byte[] macSalt  = retrieve(context, "mac_salt");
+    Mac hmac        = getMacForPassphrase(context, passphrase, macSalt);
 
     byte[] encryptedData = new byte[encryptedAndMacdData.length - hmac.getMacLength()];
     System.arraycopy(encryptedAndMacdData, 0, encryptedData, 0, encryptedData.length);
@@ -357,14 +383,16 @@ public class MasterSecretUtil {
     else                                   throw new InvalidPassphraseException("MAC Error");
   }
 
-  private static byte[] macWithPassphrase(byte[] macSalt, int iterations, byte[] data, String passphrase) throws GeneralSecurityException {
-    Mac hmac       = getMacForPassphrase(passphrase, macSalt, iterations);
+  private static byte[] macWithPassphrase(Context context, byte[] data, String passphrase) throws GeneralSecurityException {
+    byte[] macSalt = generateSalt();
+    Mac hmac       = getMacForPassphrase(context, passphrase, macSalt);
     byte[] mac     = hmac.doFinal(data);
     byte[] result  = new byte[data.length + mac.length];
 
     System.arraycopy(data, 0, result, 0, data.length);
     System.arraycopy(mac,  0, result, data.length, mac.length);
 
+    save(context, "mac_salt", macSalt);
     return result;
   }
 }
